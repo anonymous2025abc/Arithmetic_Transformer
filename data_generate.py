@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""
+data_generate.py
+
+Dispatches to individual generation scripts under /data_generation_script/individual_task_scripts/.
+
+Usage:
+    python data_generate.py --task <task> --num_operands <n> --experiment_name <name> \
+        [--train_size N] [--test_size N] [--val_size N] \
+        [--train_eval] [--sample-size N] [--generate_reverse] [--randomize {units,tens,hundreds,thousands}]
+
+Example:
+    python data_generate.py --task addition --num_operands 4 --experiment_name 4_operands_0_to_999_uniform \
+        --train_size 1000000 --test_size 10000 --val_size 10000 --train_eval True --sample-size 10000 --generate_reverse True
+
+Notes:
+ - --task (required): one of the supported tasks (addition, multiplication, sorting, ...).
+ - --num_operands (optional, default 4): how many operands the generator should use (only passed to generators that accept it).
+ - --experiment_name (required): name used to build the default output directory (unless --output_path is supplied).
+ - --output_path / -o: optional explicit output directory (overrides default data/<experiment_name>).
+ - --train_eval: if present/true, a train_eval file will be produced (sampling controlled by --sample-size).
+ - --generate_reverse: if present/true, runs reverse_results.py on generated files at the end.
+
+This script runs the target generator as a separate Python process and passes the chosen output path as --output_dir (same format as addition_gen.py).
+If --output_path is omitted, default is parent_dir/data/{experiment_name}.
+If --train_eval is given, runs sample.py to produce train_eval.txt from train.txt.
+"""
+
+import argparse
+import os
+import subprocess
+import sys
+
+# Defaults must match the generator scripts (addition_gen.py)
+DEFAULT_NUM_OPERANDS = 4
+DEFAULT_TRAIN_SIZE = 1_000_000
+DEFAULT_TEST_SIZE = 10_000
+DEFAULT_VAL_SIZE = 10_000
+DEFAULT_SAMPLE_SIZE = 10_000
+
+RANDOMIZE_CHOICES = ("units", "tens", "hundreds", "thousands")
+
+TASK_MAP = {
+    "addition": {
+        "file": os.path.join("data_generation_script", "individual_task_scripts", "addition", "addition_gen.py"),
+        "accepts_num_operands": True,
+        "generate_reverse": True,
+    },
+    "multiplication": {
+        "file": os.path.join("data_generation_script", "individual_task_scripts", "multiplication", "multiplication_gen_v2.py"),
+        # multiplication_gen.py now accepts --num_operands
+        "accepts_num_operands": False,
+        "generate_reverse": True,
+    },
+    "sorting": {
+        "file": os.path.join("data_generation_script", "individual_task_scripts", "sorting", "doubly_bal_gen.py"),
+        # set True/False depending on your sorting_gen implementation
+        "accepts_num_operands": False,
+        "generate_reverse": False,
+    },
+    "comparison": {
+        "file": os.path.join("data_generation_script", "individual_task_scripts", "comparison", "bal_gen.py"),
+        "accepts_num_operands": False,
+        "generate_reverse": False,
+    },
+}
+
+def default_data_dir():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, "data")
+
+
+def run_subprocess(cmd):
+    """Run command and forward stdout/stderr. Raise RuntimeError on non-zero exit."""
+    print("Running:", " ".join(cmd))
+    proc = subprocess.run(cmd)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command exited with code {proc.returncode}")
+
+def script_abs_path(rel_path: str) -> str:
+    """Resolve a repo-relative script path to an absolute path based on this file's directory."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Dispatch data generation tasks (runs each generator in a separate Python process)."
+    )
+    parser.add_argument(
+        "--task",
+        choices=list(TASK_MAP.keys()),
+        required=True,
+        help="Which task to generate data for. Supported: " + ", ".join(TASK_MAP.keys()),
+    )
+
+    parser.add_argument(
+        "--reasoning_mode",
+        type=int,
+        choices=[1, 2],
+        default=None,
+        help=(
+            "Addition-only. If set to 1 or 2, post-process train/val/test/(train_eval) with "
+            "addition/reasoning_data_gen.py using --mode plain (1) or plain_v2 (2)."
+        ),
+    )
+    parser.add_argument(
+        "--num_operands",
+        type=int,
+        default=DEFAULT_NUM_OPERANDS,
+        help="Number of operands (usually 2, 3, or 4).",
+    )
+
+    parser.add_argument(
+        "--randomize",
+        choices=RANDOMIZE_CHOICES,
+        default=None,
+        help=(
+            "Addition-only. If set, dispatches to addition_result_digit_randomized.py and randomizes "
+            "the chosen result digit (units/tens/hundreds/thousands)."
+        ),
+    )
+    parser.add_argument(
+        "--experiment_name",
+        required=True,
+        help=(
+            "Name of the experiment. If --output_path is not specified, "
+            "the default output directory will be /data/{experiment_name}."
+        ),
+    )
+    parser.add_argument(
+        "--train_size",
+        type=int,
+        default=DEFAULT_TRAIN_SIZE,
+        help=f"Number of training examples (default: {DEFAULT_TRAIN_SIZE})",
+    )
+    parser.add_argument(
+        "--test_size",
+        type=int,
+        default=DEFAULT_TEST_SIZE,
+        help=f"Number of test examples (default: {DEFAULT_TEST_SIZE})",
+    )
+    parser.add_argument(
+        "--val_size",
+        type=int,
+        default=DEFAULT_VAL_SIZE,
+        help=f"Number of validation examples (default: {DEFAULT_VAL_SIZE})",
+    )
+    parser.add_argument(
+        "--train_eval",
+        type=lambda s: s.lower() in ("true", "1", "yes"),
+        default=False,
+        help="Whether to create a train_eval file. Accepts True/False (case-insensitive).",
+    )
+    parser.add_argument(
+        "--sample-size",
+        type=int,
+        default=DEFAULT_SAMPLE_SIZE,
+        help=f"Number of lines to sample for train_eval (default: {DEFAULT_SAMPLE_SIZE}). Only used if --train_eval is set.",
+    )
+    parser.add_argument(
+        "--generate_reverse",
+        type=lambda s: s.lower() in ("true", "1", "yes"),
+        default=False,
+        help="Whether to run reverse_results.py at the end. Accepts True/False (case-insensitive).",
+    )
+    parser.add_argument(
+        "--a_probabilities",
+        "--a_length_probs",
+        dest="a_probabilities",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated probabilities for operand 'a' digit lengths (multiplication task only). "
+            "Index 0 corresponds to 1-digit numbers, index 1 to 2-digit numbers, etc."
+        ),
+    )
+    parser.add_argument(
+        "--b_probabilities",
+        "--b_length_probs",
+        dest="b_probabilities",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated probabilities for operand 'b' digit lengths (multiplication task only). "
+            "Index 0 corresponds to 1-digit numbers, index 1 to 2-digit numbers, etc."
+        ),
+    )
+    parser.add_argument(
+        "--a_max_digits",
+        type=int,
+        default=None,
+        help=(
+            "Positive integer specifying the maximum digit length for operand 'a' when probabilities are not provided "
+            "(multiplication task only)."
+        ),
+    )
+    parser.add_argument(
+        "--b_max_digits",
+        type=int,
+        default=None,
+        help=(
+            "Positive integer specifying the maximum digit length for operand 'b' when probabilities are not provided "
+            "(multiplication task only)."
+        ),
+    )
+    parser.add_argument(
+        "--max_digits",
+        type=int,
+        default=None,
+        help=(
+            "Positive integer specifying the maximum digit length to apply to both operands when individual bounds are "
+            "omitted (multiplication task only)."
+        ),
+    )
+
+
+    args = parser.parse_args()
+
+    # reasoning_mode is only supported for addition
+    if args.reasoning_mode is not None and args.task != "addition":
+        print("Error: --reasoning_mode is only supported when --task is addition.", file=sys.stderr)
+        sys.exit(2)
+
+    # Validate num_operands bounds: generators accept up to 6 operands for digit-based tasks.
+    if args.num_operands is None:
+        num_operands = DEFAULT_NUM_OPERANDS
+    else:
+        num_operands = args.num_operands
+
+    if num_operands < 1:
+        print("Error: --num_operands must be >= 1.", file=sys.stderr)
+        sys.exit(2)
+
+    if num_operands > 6:
+        # Send message to user and exit with non-zero status.
+        print(
+            f"Error: --num_operands must be <= 6 (you provided {num_operands}). "
+            "Please choose a value in the range 1..6.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    task = args.task
+    experiment_name = args.experiment_name
+
+    output_path = os.path.abspath(os.path.join(default_data_dir(), experiment_name))
+    is_comparison = (task == "comparison")
+    is_sorting = (task == "sorting")
+    needs_test_subdir = is_comparison or is_sorting
+    fixed_size_task = is_comparison or is_sorting
+
+    # ensure output directory exists
+    try:
+        os.makedirs(output_path, exist_ok=True)
+    except Exception as e:
+        print(f"Failed to create output directory {output_path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    entry = TASK_MAP.get(task)
+    if entry is None:
+        print(f"Unknown task: {task}", file=sys.stderr)
+        sys.exit(2)
+
+    # Decide which generator script to call (addition can be overridden by --randomize)
+    addition_randomize = False
+    rel_script_path = entry["file"]
+
+    if args.randomize is not None:
+        if task != "addition":
+            print("Error: --randomize is only supported for --task addition.", file=sys.stderr)
+            sys.exit(2)
+        addition_randomize = True
+        rel_script_path = os.path.join(
+            "data_generation_script",
+            "individual_task_scripts",
+            "addition",
+            "addition_result_digit_randomized.py",
+        )
+        # That script is 4-operand fixed; avoid passing --num_operands to it and enforce 4 for safety.
+        if num_operands != 4:
+            print("Error: --randomize currently requires --num_operands 4 for addition.", file=sys.stderr)
+            sys.exit(2)
+
+    # path to the generator script (relative to this file)
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_script_path)
+
+    if not os.path.exists(file_path):
+        print(f"Generator script not found: {file_path}", file=sys.stderr)
+        sys.exit(3)
+
+    # Always pass --output_dir and the size flags to child script (addition_gen.py expects these flags).
+    gen_cmd = [
+        sys.executable,
+        file_path,
+    ]
+
+    # Only pass --num_operands to scripts that support it; randomized addition script does not.
+    if entry.get("accepts_num_operands", False) and not addition_randomize:
+        gen_cmd += ["--num_operands", str(num_operands)]
+
+    # Output dir flag differs by task/script
+    if addition_randomize:
+        gen_cmd += ["--out-dir", output_path, "--mask-digit", args.randomize]
+    elif fixed_size_task:
+        gen_cmd += ["--outdir", output_path]
+    else:
+        gen_cmd += ["--output_dir", output_path]
+
+    # Sizes: pass to all tasks EXCEPT comparison & sorting (fixed sizes inside their scripts)
+    if not fixed_size_task:
+        gen_cmd += [
+            "--train_size", str(args.train_size),
+            "--test_size", str(args.test_size),
+            "--val_size", str(args.val_size),
+        ]
+    else:
+        # Optional clarity so users know flags are ignored
+        if (args.train_size != DEFAULT_TRAIN_SIZE) or (args.test_size != DEFAULT_TEST_SIZE) or (args.val_size != DEFAULT_VAL_SIZE):
+            print(f"Note: {task} task uses fixed sizes from its generator; ignoring --train_size/--test_size/--val_size.")
+
+    if task == "multiplication":
+        if args.a_probabilities is not None:
+            gen_cmd += ["--a_probabilities", args.a_probabilities]
+        if args.b_probabilities is not None:
+            gen_cmd += ["--b_probabilities", args.b_probabilities]
+        if args.a_max_digits is not None:
+            gen_cmd += ["--a_max_digits", str(args.a_max_digits)]
+        if args.b_max_digits is not None:
+            gen_cmd += ["--b_max_digits", str(args.b_max_digits)]
+        if args.max_digits is not None:
+            gen_cmd += ["--max_digits", str(args.max_digits)]
+
+
+    try:
+        print(f"Running generator for task '{task}', experiment '{experiment_name}'")
+        run_subprocess(gen_cmd)
+    except RuntimeError as e:
+        print(f"Generator failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print("Generation finished successfully.")
+
+    # For comparison and sorting: move test.txt into output_path/test/test.txt
+    if needs_test_subdir:
+        test_src = os.path.join(output_path, "test.txt")
+        test_dir = os.path.join(output_path, "test")
+        test_dst = os.path.join(test_dir, "test.txt")
+        try:
+            os.makedirs(test_dir, exist_ok=True)
+            if not os.path.exists(test_src):
+                print(f"Warning: expected test file not found: {test_src}", file=sys.stderr)
+            else:
+                # overwrite if exists
+                if os.path.exists(test_dst):
+                    os.remove(test_dst)
+                os.replace(test_src, test_dst)
+                print(f"Moved test set to: {test_dst}")
+        except Exception as e:
+            print(f"Failed to move comparison test file into subfolder: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # For comparison: generate additional single-digit-diff test files into output_path/test
+    if is_comparison:
+        extra_test_script_rel = os.path.join(
+            "data_generation_script",
+            "individual_task_scripts",
+            "comparison",
+            "single_digit_diff_test_gen.py",
+        )
+        extra_test_script = script_abs_path(extra_test_script_rel)
+
+        if not os.path.exists(extra_test_script):
+            print(f"Warning: extra comparison test generator not found: {extra_test_script}", file=sys.stderr)
+        else:
+            test_dir = os.path.join(output_path, "test")  # ensured created above
+            extra_cmd = [
+                sys.executable,
+                extra_test_script,
+                "--outdir",
+                test_dir,
+            ]
+            try:
+                print("Generating additional comparison tests (single-digit-diff) into:", test_dir)
+                run_subprocess(extra_cmd)
+            except RuntimeError as e:
+                print(f"Additional comparison test generation failed: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    # For comparison: generate digitwise test files into output_path/test
+    if is_comparison:
+        digitwise_script_rel = os.path.join(
+            "data_generation_script",
+            "individual_task_scripts",
+            "comparison",
+            "digitwise_test_gen.py",
+        )
+        digitwise_script = script_abs_path(digitwise_script_rel)
+
+        if not os.path.exists(digitwise_script):
+            print(f"Warning: digitwise comparison test generator not found: {digitwise_script}", file=sys.stderr)
+        else:
+            test_dir = os.path.join(output_path, "test")  # ensured created above
+            digitwise_cmd = [
+                sys.executable,
+                digitwise_script,
+                "--outdir",
+                test_dir,
+            ]
+            try:
+                print("Generating additional comparison tests (digitwise) into:", test_dir)
+                run_subprocess(digitwise_cmd)
+            except RuntimeError as e:
+                print(f"Digitwise comparison test generation failed: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    # For sorting: generate additional digitwise test files into output_path/test
+    if is_sorting:
+        sorting_digitwise_rel = os.path.join(
+            "data_generation_script",
+            "individual_task_scripts",
+            "sorting",
+            "digitwise_test_gen.py",
+        )
+        sorting_digitwise_script = script_abs_path(sorting_digitwise_rel)
+
+        if not os.path.exists(sorting_digitwise_script):
+            print(f"Warning: sorting digitwise test generator not found: {sorting_digitwise_script}", file=sys.stderr)
+        else:
+            test_dir = os.path.join(output_path, "test")  # ensured created above
+
+            # Map requested output names to the script's variants
+            variant_to_outfile = [
+                ("random", "digitwise_random.txt"),
+                ("thousands", "digitwise_thousand.txt"),
+                ("thousands_hundreds", "digitwise_hundred.txt"),
+                ("thousands_hundreds_tens", "digitwise_ten.txt"),
+            ]
+
+            try:
+                print("Generating additional sorting digitwise tests into:", test_dir)
+                for variant, fname in variant_to_outfile:
+                    out_path = os.path.join(test_dir, fname)
+                    cmd = [
+                        sys.executable,
+                        sorting_digitwise_script,
+                        "--variant", variant,
+                        "-n", "1000",                 # change to "3000" if you want the old default
+                        "--outdir", test_dir,          # ensures files land under test/
+                        "--out", fname,                # requested filename
+                    ]
+                    run_subprocess(cmd)
+            except RuntimeError as e:
+                print(f"Sorting digitwise test generation failed: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    # For sorting: generate additional constraint-based test files into output_path/test
+    if is_sorting:
+        test_dir = os.path.join(output_path, "test")  # ensured created earlier
+
+        extra_sorting_scripts = [
+            os.path.join(
+                "data_generation_script",
+                "individual_task_scripts",
+                "sorting",
+                "conflicting_agreeing_digit_1_3_same.py",
+            ),
+            os.path.join(
+                "data_generation_script",
+                "individual_task_scripts",
+                "sorting",
+                "same_digit_control_with_conflicting_digit.py",
+            ),
+        ]
+
+        for rel in extra_sorting_scripts:
+            script_path = script_abs_path(rel)
+            if not os.path.exists(script_path):
+                print(
+                    f"Warning: extra sorting test generator not found: {script_path}",
+                    file=sys.stderr,
+                )
+                continue
+
+            cmd = [
+                sys.executable,
+                script_path,
+                "--outdir",
+                test_dir,
+                "--seed",
+                "42",
+                "--n",
+                "1000",
+            ]
+            try:
+                print("Generating additional sorting tests via:", rel)
+                run_subprocess(cmd)
+            except RuntimeError as e:
+                print(
+                    f"Additional sorting test generation failed ({os.path.basename(rel)}): {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+    # If requested, run sample.py to create train_eval.txt from train.txt
+    if args.train_eval:
+        sample_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_generation_script", "sample.py")
+        if not os.path.exists(sample_script):
+            print(f"sample.py not found at {sample_script}", file=sys.stderr)
+            sys.exit(4)
+
+        input_train = os.path.join(output_path, "train.txt")
+        output_train_eval = os.path.join(output_path, "train_eval.txt")
+
+        if not os.path.exists(input_train):
+            print(f"Expected train file not found: {input_train}", file=sys.stderr)
+            sys.exit(5)
+
+        # argparse turns '--sample-size' into attribute 'sample_size'
+        sample_size_arg = getattr(args, "sample_size", DEFAULT_SAMPLE_SIZE)
+
+        sample_cmd = [
+            sys.executable,
+            sample_script,
+            "--input", input_train,
+            "--output", output_train_eval,
+            "--sample-size", str(sample_size_arg),
+        ]
+
+        try:
+            print(f"Sampling {sample_size_arg} lines to create train_eval at '{output_train_eval}'")
+            run_subprocess(sample_cmd)
+        except RuntimeError as e:
+            print(f"Sampling failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        print("Sampling finished successfully.")
+
+    # If requested, run reverse_results.py on generated files
+    if args.generate_reverse and entry.get("generate_reverse", False):
+        reverse_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_generation_script", "reverse_results.py")
+        if not os.path.exists(reverse_script):
+            print(f"reverse_results.py not found at {reverse_script}", file=sys.stderr)
+            sys.exit(6)
+
+        # Build filenames in the order requested by you:
+        # if train_eval: train.txt train_eval.txt test.txt val.txt
+        # else:          train.txt test.txt val.txt
+        filenames = ["train.txt"]
+        if args.train_eval:
+            filenames.append("train_eval.txt")
+        filenames.extend(["test.txt", "val.txt"])
+
+        # Verify input files exist before calling
+        missing = [f for f in filenames if not os.path.exists(os.path.join(output_path, f))]
+        if missing:
+            print(f"Missing files required for reverse step: {missing}", file=sys.stderr)
+            sys.exit(7)
+
+        rev_cmd = [sys.executable, reverse_script] + filenames + ["--dir", output_path]
+        try:
+            print(f"Running reverse_results on: {', '.join(filenames)}")
+            run_subprocess(rev_cmd)
+        except RuntimeError as e:
+            print(f"reverse_results failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        print("reverse_results finished successfully.")
+
+    # If requested, post-process addition data into "reasoning" format (scratchpad files)
+    if args.reasoning_mode is not None:
+        reasoning_script_rel = os.path.join(
+            "data_generation_script",
+            "individual_task_scripts",
+            "addition",
+            "reasoning_data_gen.py",
+        )
+        reasoning_script = script_abs_path(reasoning_script_rel)
+        if not os.path.exists(reasoning_script):
+            print(f"reasoning_data_gen.py not found at {reasoning_script}", file=sys.stderr)
+            sys.exit(8)
+
+        mode_flag = "plain" if args.reasoning_mode == 1 else "plain_v2"
+        scratchpad_suffix = f"scratchpad{args.reasoning_mode}"
+
+        split_files = ["train.txt", "val.txt", "test.txt"]
+        if args.train_eval:
+            split_files.append("train_eval.txt")
+
+        # Ensure all required input files exist before starting
+        missing = [f for f in split_files if not os.path.exists(os.path.join(output_path, f))]
+        if missing:
+            print(f"Missing files required for reasoning post-process: {missing}", file=sys.stderr)
+            sys.exit(9)
+
+        print(
+            f"Running reasoning post-process for addition with reasoning_mode={args.reasoning_mode} "
+            f"(mode={mode_flag})"
+        )
+
+        for fname in split_files:
+            in_file = os.path.join(output_path, fname)
+
+            # train.txt -> train_scratchpad1.txt (or scratchpad2)
+            out_fname = fname.replace(".txt", f"_{scratchpad_suffix}.txt")
+            out_file = os.path.join(output_path, out_fname)
+
+            cmd = [
+                sys.executable,
+                reasoning_script,
+                "--input_file_path", in_file,
+                "--output_file_path", out_file,
+                "--mode", mode_flag,
+            ]
+            run_subprocess(cmd)
+
+        print("Reasoning post-process finished successfully.")
+
+
+if __name__ == "__main__":
+    main()
